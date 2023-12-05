@@ -513,5 +513,11 @@ for epoch in range(num_epochs):
 
 log.close()
 
+model.load_state_dict(torch.load(f'models/{model.name}.pth'))
+#test_dataset = SleepDataset(parquet_file='dataset/train_toy.parquet', sequence_length=sequence_length, is_test=False)
 
+test_dataset = SleepDataset(parquet_file='data/combined_3.parquet', sequence_length=300, is_test=True)
+test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False, num_workers=1)
+pred_dict = predict(model, test_loader)
+events = get_events(pred_dict)
 

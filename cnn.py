@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from sklearn.metrics import precision_score, recall_score, f1_score
-
+from scipy.signal import savgol_filter
 
 class SleepDataset(Dataset):
     def __init__(self, parquet_file, sequence_length, is_test=False):
@@ -161,6 +161,171 @@ def test_model(model, test_loader, criterion):
     return accuracy, average_loss, precision, recall, f1
 
 
+#converts a list of parallel series_ids and predictions to a dictionary with series_ids as keys and prediction sequences as values
+def pred_to_dict(series_ids, steps, predictions):
+    curr_series = None
+    pred_dict = {}
+    curr_series = series_ids[0]
+    pred_dict[curr_series] = {"preds": [], "steps": []}
+
+    for series_id, step, pred in tqdm(zip(series_ids, steps, predictions)):
+        if curr_series != series_id:
+            curr_series = series_id
+            pred_dict[curr_series] = {"preds": [], "steps": []}
+
+        pred_dict[series_id]["preds"].append(pred)
+        pred_dict[series_id]["steps"].append(step)
+
+    return pred_dict
+
+#given a dictionary of preds, drops any state boundry that does not have threshold% of one label type on the left and threshold% of the
+#other label type on the right
+def remove_outliers(pred_dict, window_size=280, threshold=.8):
+    new_dict = {}
+
+    for series_id, series_dict in tqdm(pred_dict.items()):
+        new_seq = []
+        pred_seq = series_dict["preds"]
+
+        for i in range(len(pred_seq)):
+            if i < window_size:
+                left_window = pred_seq[:i]
+            else:
+                left_window = pred_seq[i - window_size:i]
+
+            if len(pred_seq) - i < window_size:
+                right_window = pred_seq[i:]
+            else:
+                right_window = pred_seq[i:i+window_size]
+
+            #check if pred in the middle of the window is on a state boundry
+            if i > 0 and i < len(pred_seq) - window_size - 1 and left_window[-1] != right_window[0]:
+                #get the proportion of labels in right window that are the same as the edge pred
+                right_counts = np.bincount(right_window, minlength=2)
+                r_similar = right_counts[abs(right_window[0] - 1)] / len(right_window)
+
+                #get the proportion of labels in the left window that are different from the edge pred
+                left_counts = np.bincount(left_window, minlength = 2)
+                l_similar = left_counts[abs(right_window[0] - 1)] / len(left_window)
+
+                #if the predicted label occurs frequently in both windows, then either l_similar or r_similar will be low and this will pass
+                if l_similar >= threshold and r_similar >= threshold:
+                    #flips state label
+                    print(i, "fliped")
+                    new_seq.append(abs(right_window[0] - 1))
+                else:
+                    new_seq.append(right_window[0])
+
+            else:
+                new_seq.append(right_window[0])
+        new_dict[series_id] = {}
+        new_dict[series_id]["preds"] = new_seq
+        new_dict[series_id]["steps"] = series_dict["steps"]
+
+    return new_dict
+
+#Note: run remove outliers firsts so that edges are clustered around true edges
+#given a dictionary of predictions, find and choose the best edge in a cluster of edges
+#returns a new dictionary with one state boundry per window_size cluster
+def get_local_best(pred_dict, window_size=360):
+
+    new_dict = {}
+
+    for series_id, series_dict in tqdm(pred_dict.items()):
+        pred_seq = series_dict["preds"]
+
+        new_seq = [pred_seq[0]]
+        i = 1
+        while i < len(pred_seq) - 1:
+            print("idx: ", i)
+            print("len: ", len(new_seq))
+            #if a boundry is found
+            if pred_seq[i] != pred_seq[i-1]:
+                #all previous labels were smooth, so find all boundries to the right inside of the window
+                window = pred_seq[i: i + window_size]
+                # print(window)
+
+                counts = np.bincount(window, minlength = 2)
+                most_common = 1 if counts[1] > counts[0] else 0
+
+                indicies = [j for j in range(0, len(window)) if window[j] != most_common]
+
+                #sample an index from the distribution of boundries in the cluster window
+                # print(indicies)
+                if indicies:
+                  mean = np.mean(indicies)
+                  std = np.std(indicies)
+                  # print(std)
+                  best = int(random.gauss(mean, std))
+                else:
+                  best = 0
+
+                #add the previous state up to the sampled label, and the new state after the sampled label
+                new_seq.extend([abs(most_common - 1)] * best)
+                new_seq.extend([most_common] * (window_size - best))
+                i += window_size
+
+            #if label is not an edge, add to the new pred sequence
+            else:
+                new_seq.append(pred_seq[i])
+                i += 1
+
+        new_dict[series_id] = {}
+        new_seq.append(pred_dict[series_id]["preds"][-1])
+        print(i)
+        print(len(new_seq))
+        new_dict[series_id]["preds"] = new_seq
+        new_dict[series_id]["steps"] = series_dict["steps"]
+
+    return new_dict
+
+def predict(model, test_loader):
+    model.eval()
+
+    # Make predictions on the test dataset
+    predictions = []
+    series_ids = []
+    steps = []
+    with torch.no_grad():
+        for batch in tqdm(test_loader):
+
+            input_data = batch['data'].to(device)
+
+            # Forward pass
+            logits = model(input_data)
+
+            # Convert logits to predictions
+            _, predicted = torch.max(logits, 2)
+            predictions.extend(predicted.cpu().numpy()[0])
+            series_ids.extend(np.full(len(predicted.cpu().numpy()[0]), batch['series_id'][0]))
+            steps.extend(batch['step'].cpu().numpy()[0])
+
+    return pred_to_dict(series_ids, steps, predictions)
+
+def get_events(pred_dict):
+    round_func = np.vectorize(lambda i: 1 if i > 0.5 else 0)
+
+    for series_id, series_dict in tqdm(pred_dict.items()):
+      pred_dict[series_id]['preds'] = round_func(savgol_filter(pred_dict[series_id]['preds'], window_length=3000, polyorder=2))
+
+    prediction_rows = []
+    curr_state = None
+    for series_id, series_dict in tqdm(pred_dict.items()):
+        curr_state = series_dict["preds"][0]
+        for pred, step in zip(series_dict["preds"][1:],  series_dict["steps"][1:]):
+
+            if pred != curr_state:
+                curr_state = pred
+                event = 'wakeup' if curr_state == 1 else 'onset'
+                prediction_rows.append({
+                    'row_id': len(prediction_rows),
+                    'series_id': series_id,
+                    'step': int(step),
+                    'event': event,
+                    'score': 1.0
+                })
+    return pd.DataFrame(prediction_rows)
+
 # Example usage for training DataLoader
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 batch_size = 8  # Adjust based on your needs
@@ -225,5 +390,12 @@ for epoch in range(num_epochs):
 
 log.close()
 
+model.load_state_dict(torch.load(f'models/{model.name}.pth'))
+#test_dataset = SleepDataset(parquet_file='dataset/train_toy.parquet', sequence_length=sequence_length, is_test=False)
+
+test_dataset = SleepDataset(parquet_file='data/combined_3.parquet', sequence_length=300, is_test=True)
+test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False, num_workers=1)
+pred_dict = predict(model, test_loader)
+events = get_events(pred_dict)
 
 
