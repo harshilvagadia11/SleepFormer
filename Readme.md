@@ -2,6 +2,7 @@
 
 ## About this Project
 Refer to `report.pdf` for details on this project.
+![poster](https://github.com/HV007/SleepFormer/blob/main/poster.png)
 
 ## Dataset
 Download the sleep labelled accelerometer timeseries data from this <a link=https://www.kaggle.com/competitions/child-mind-institute-detect-sleep-states> link </a>. Run `Data_convert.ipynb` to convert the events into sleep states. The converted data will be used as the input to the models.
